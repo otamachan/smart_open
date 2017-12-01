@@ -7,6 +7,8 @@ import logging
 
 import six
 
+from six.moves import queue
+import threading
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
@@ -17,6 +19,8 @@ CURRENT = 1
 END = 2
 WHENCE_CHOICES = (START, CURRENT, END)
 
+DEFAULT_READ_BUFFER_SIZE = 20 * 1024**2
+"""Default read buffer size"""
 DEFAULT_MIN_PART_SIZE = 50 * 1024**2
 """Default minimum part size for S3 multipart uploads"""
 MIN_MIN_PART_SIZE = 5 * 1024 ** 2
@@ -47,7 +51,6 @@ def open(bucket_id, key_id, mode, **kwargs):
     if mode not in MODES:
         raise NotImplementedError('bad mode: %r expected one of %r' % (mode, MODES))
 
-    buffer_size = kwargs.pop("buffer_size", io.DEFAULT_BUFFER_SIZE)
     encoding = kwargs.pop("encoding", "utf-8")
     errors = kwargs.pop("errors", None)
     newline = kwargs.pop("newline", None)
@@ -73,22 +76,45 @@ def open(bucket_id, key_id, mode, **kwargs):
 class RawReader(object):
     """Read an S3 object."""
     def __init__(self, s3_object):
-        self.position = 0
         self._object = s3_object
         self._content_length = self._object.content_length
+        self._buffer_pos = 0
+        self._buffer = b""
+        self._request = queue.Queue()
+        self._lock = threading.Lock()
+        self._thread = threading.Thread(target=self._run)
+        self._thread.daemon = True
+        self._thread.start()
 
-    def read(self, size=-1):
-        if self.position == self._content_length:
-            return b''
-        if size <= 0:
-            end = None
-        else:
-            end = min(self._content_length, self.position + size)
-        range_string = _range_string(self.position, stop=end)
-        logger.debug('range_string: %r', range_string)
-        body = self._object.get(Range=range_string)['Body'].read()
-        self.position += len(body)
-        return body
+    def read(self, pos, size=-1):
+        while True:
+            self._request.join()
+            with self._lock:
+                if self._buffer_pos <= pos and \
+                   pos < self._buffer_pos + len(self._buffer):
+                    if not self._eof:
+                        # start next reading here
+                        self._request.put((self._buffer_pos + len(self._buffer), size))
+                    return (self._buffer[(pos - self._buffer_pos):],
+                            pos,
+                            self._eof)
+                else:
+                    self._request.put((pos, size))
+
+    def _run(self):
+        while True:
+            pos, size = self._request.get()
+            if size <= 0:
+                end = None
+            else:
+                end = min(self._content_length, pos + size)
+            buf = self._object.get(Range=_range_string(pos, end))["Body"].read()
+            logger.debug("get object from S3: size %d", len(self._buffer))
+            with self._lock:
+                self._buffer = buf
+                self._buffer_pos = pos
+                self._eof = (self._buffer_pos + len(self._buffer) == self._content_length)
+            self._request.task_done()
 
 
 class BufferedInputBase(io.BufferedIOBase):
@@ -96,16 +122,17 @@ class BufferedInputBase(io.BufferedIOBase):
 
     Implements the io.BufferedIOBase interface of the standard library."""
 
-    def __init__(self, bucket, key, **kwargs):
+    def __init__(self, bucket, key, buffer_size=DEFAULT_READ_BUFFER_SIZE, **kwargs):
         session = boto3.Session(profile_name=kwargs.pop('profile_name', None))
         s3 = session.resource('s3', **kwargs)
         self._object = s3.Object(bucket, key)
         self._raw_reader = RawReader(self._object)
+        self._buffer_size = buffer_size
         self._content_length = self._object.content_length
         self._current_pos = 0
         self._buffer = b''
+        self._buffer_pos = 0
         self._eof = False
-
         #
         # This member is part of the io.BufferedIOBase interface.
         #
@@ -149,9 +176,12 @@ class BufferedInputBase(io.BufferedIOBase):
         new_position = _clamp(new_position, 0, self._content_length)
 
         logger.debug('new_position: %r', new_position)
-        self._current_pos = self._raw_reader.position = new_position
-        self._buffer = b""
+        self._current_pos = new_position
         self._eof = self._current_pos == self._content_length
+        if new_position < self._buffer_pos or \
+           new_position >= self._buffer_pos + len(self._buffer):
+            self._buffer = b""
+            self._buffer_pos = new_position
         return self._current_pos
 
     def tell(self):
@@ -172,42 +202,53 @@ class BufferedInputBase(io.BufferedIOBase):
     def read(self, size=-1):
         """Read up to size bytes from the object and return them."""
         if size <= 0:
-            if len(self._buffer):
-                from_buf = self._read_from_buffer(len(self._buffer))
-            else:
-                from_buf = b''
-            self._current_pos = self._content_length
-            return from_buf + self._raw_reader.read()
+            to_read = self.content_length - self._current_pos
+        else:
+            to_read = size
 
-        #
-        # Return unused data first
-        #
-        if len(self._buffer) >= size:
-            return self._read_from_buffer(size)
-
-        #
-        # If the stream is finished, return what we have.
-        #
-        if self._eof:
-            return self._read_from_buffer(len(self._buffer))
-
-        #
-        # Fill our buffer to the required size.
-        #
-        # logger.debug('filling %r byte-long buffer up to %r bytes', len(self._buffer), size)
-        while len(self._buffer) < size and not self._eof:
-            raw = self._raw_reader.read(size=io.DEFAULT_BUFFER_SIZE)
-            if len(raw):
-                self._buffer += raw
-            else:
-                logger.debug('reached EOF while filling buffer')
-                self._eof = True
-
-        return self._read_from_buffer(size)
+        parts = []
+        while True:
+            pos = self._current_pos - self._buffer_pos
+            if pos + to_read <= len(self._buffer):
+                parts.append(self._buffer[pos:(pos + to_read)])
+                self._current_pos += to_read
+                break
+            elif self._buffer:
+                parts.append(self._buffer[pos:])
+                self._current_pos += len(parts[-1])
+                to_read -= len(parts[-1])
+            if self._eof:
+                break
+            self._buffer, self._buffer_pos, self._eof = self._raw_reader.read(
+                self._buffer_pos + len(self._buffer),
+                self._buffer_size)
+        return b"".join(parts)
 
     def read1(self, size=-1):
         """This is the same as read()."""
         return self.read(size=size)
+
+    def readline(self, limit=-1):
+        """Read up to and including the next newline.  Returns the bytes read."""
+        if limit != -1:
+            raise NotImplementedError('limits other than -1 not implemented yet')
+        parts = []
+        while True:
+            pos = self._current_pos - self._buffer_pos
+            new_line_pos = self._buffer.find(b'\n', pos)
+            if new_line_pos >= 0:
+                parts.append(self._buffer[pos:new_line_pos+1])
+                self._current_pos = self._buffer_pos + new_line_pos + 1
+                break
+            elif self._buffer:
+                parts.append(self._buffer[pos:])
+                self._current_pos = self._buffer_pos + len(self._buffer)
+            if self._eof:
+                break
+            self._buffer, self._buffer_pos, self._eof = self._raw_reader.read(
+                self._buffer_pos + len(self._buffer),
+                self._buffer_size)
+        return b"".join(parts)
 
     def readinto(self, b):
         """Read up to len(b) bytes into b, and return the number of bytes
@@ -221,19 +262,6 @@ class BufferedInputBase(io.BufferedIOBase):
     def terminate(self):
         """Do nothing."""
         pass
-
-    #
-    # Internal methods.
-    #
-    def _read_from_buffer(self, size):
-        """Remove at most size bytes from our buffer and return them."""
-        # logger.debug('reading %r bytes from %r byte-long buffer', size, len(self._buffer))
-        assert size >= 0
-        part = self._buffer[:size]
-        self._buffer = self._buffer[size:]
-        self._current_pos += len(part)
-        # logger.debug('part: %r', part)
-        return part
 
 
 class BufferedOutputBase(io.BufferedIOBase):
