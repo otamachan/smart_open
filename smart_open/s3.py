@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """Implements file-like objects for reading and writing from/to S3."""
+import boto
 import boto3
 import botocore.client
 
@@ -90,23 +91,32 @@ class SeekableRawReader(object):
     """Read an S3 object.
 
     Support seeking around, but is slower than RawReader."""
-    def __init__(self, s3_object):
-        self.position = 0
-        self._object = s3_object
-        self._content_length = self._object.content_length
+    def __init__(self, bucket_obj, key_name, content_length):
+        self._bucket_obj = bucket_obj
+        self._key_name = key_name
+        self._content_length = content_length
+        self._key = None
+        self.set_position(0)
 
     def read(self, size=-1):
-        if self.position == self._content_length:
+        if self._position >= self._content_length:
             return b''
-        if size <= 0:
-            end = None
+        buf = self._key.read(size)
+        self._position += len(buf)
+        return buf
+
+    def set_position(self, position):
+        if self._key is not None:
+            self._key.close()
+        if position >= self._content_length:
+            position = self._content_length
         else:
-            end = min(self._content_length, self.position + size)
-        range_string = _range_string(self.position, stop=end)
-        logger.debug('range_string: %r', range_string)
-        body = self._object.get(Range=range_string)['Body'].read()
-        self.position += len(body)
-        return body
+            headers = {"Range": _range_string(position)}
+            self._key = self._bucket_obj.get_key(
+                self._key_name,
+                headers=headers)
+            self._key.open_read(headers=headers)
+        self._position = position
 
 
 class BufferedInputBase(io.BufferedIOBase):
@@ -250,11 +260,11 @@ class SeekableBufferedInputBase(BufferedInputBase):
 
     def __init__(self, bucket, key, buffer_size=DEFAULT_BUFFER_SIZE,
                  line_terminator=BINARY_NEWLINE, **kwargs):
-        session = boto3.Session(profile_name=kwargs.pop('profile_name', None))
-        s3 = session.resource('s3', **kwargs)
-        self._object = s3.Object(bucket, key)
-        self._raw_reader = SeekableRawReader(self._object)
-        self._content_length = self._object.content_length
+        self._s3_connection = boto.connect_s3(
+            profile_name=kwargs.pop('profile_name', None))
+        bucket_obj = self._s3_connection.get_bucket(bucket)
+        self._content_length = bucket_obj.lookup(key).size
+        self._raw_reader = SeekableRawReader(bucket_obj, key, self._content_length)
         self._current_pos = 0
         self._buffer = b''
         self._eof = False
@@ -292,7 +302,8 @@ class SeekableBufferedInputBase(BufferedInputBase):
         new_position = _clamp(new_position, 0, self._content_length)
 
         logger.debug('new_position: %r', new_position)
-        self._current_pos = self._raw_reader.position = new_position
+        self._current_pos = new_position
+        self._raw_reader.set_position(new_position)
         self._buffer = b""
         self._eof = self._current_pos == self._content_length
         return self._current_pos
